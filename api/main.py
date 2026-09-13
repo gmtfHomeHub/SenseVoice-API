@@ -37,7 +37,7 @@ PREWARM_SECONDS = float(os.getenv("PREWARM_SECONDS", "2"))
 VAD_MODEL = os.getenv("VAD_MODEL", "fsmn-vad")
 # 单个 VAD 段的最大时长（毫秒）。连续语音超过该值会被强制切开，
 # 保证每段都落在 SenseVoice 的有效输入范围内。
-VAD_MAX_SEGMENT_MS = int(os.getenv("VAD_MAX_SEGMENT_MS", "30000"))
+VAD_MAX_SEGMENT_MS = int(os.getenv("VAD_MAX_SEGMENT_MS", "20000"))
 # merge_vad 把相邻 VAD 段合并到的上限（秒），让 ASR 有上下文又不超长。
 VAD_MERGE_LENGTH_S = int(os.getenv("VAD_MERGE_LENGTH_S", "15"))
 
@@ -374,15 +374,15 @@ def _transcribe_sync(
             "processing_time": round(elapsed, 3),
         }
 
-        # Speaker diarization segments (cam++ model)
+        # 说话人分段（cam++ + VAD 的 sentence_info）与字级时间戳都要返回，
+        # 两者不互斥：原始 result 同时带 sentence_info / timestamp / words，
+        # 写成 if/else 会让客户端在开启 ENABLE_SPK 后拿不到字级时间戳。
         speaker_segments = _extract_speaker_segments(result)
         if speaker_segments:
             response["segments"] = speaker_segments
-        else:
-            # Word-level timestamps if no speaker info
-            segments = _extract_timestamps(result)
-            if segments:
-                response["words"] = segments
+        word_segments = _extract_timestamps(result)
+        if word_segments:
+            response["words"] = word_segments
 
         return JSONResponse(content=response)
 

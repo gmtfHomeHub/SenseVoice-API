@@ -62,8 +62,13 @@ services:
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `VAD_MODEL` | `fsmn-vad` | VAD 模型（映射到 HF 的 `funasr/fsmn-vad`，~25MB）。置为空字符串关闭，仅用于调试 |
-| `VAD_MAX_SEGMENT_MS` | `30000` | 单个 VAD 段的最大时长（毫秒），超长连续语音会被强制切开 |
-| `VAD_MERGE_LENGTH_S` | `15` | 相邻 VAD 段合并到的上限（秒），保证每段都 ≤15s |
+| `VAD_MAX_SEGMENT_MS` | `20000` | 单个 VAD 段的**硬上限**（毫秒）。连续语音超过该值会被强制切开 |
+| `VAD_MERGE_LENGTH_S` | `15` | 相邻 VAD 短段合并到的上限（秒） |
+
+> ⚠ `merge_vad` **只合并、不切分**：`merge_vad(vad_result, max_length)` 在
+> `len(vad_result) <= 1` 时直接原样返回。所以真正限制单段长度的是
+> `VAD_MAX_SEGMENT_MS`，不是 `VAD_MERGE_LENGTH_S`。
+> SenseVoice 文档上限为 30s，默认取 20s 留一档安全裕量。
 
 **为什么要开 VAD**：SenseVoiceSmall 只在约 30s 以内的音频上训练（LFR 帧率 16.7 帧/s，
 `config.yaml` 的 `max_source_length=2000` 帧）。不加 `vad_model` 时，funasr 的
