@@ -1,4 +1,5 @@
 import io
+import logging
 import math
 import os
 import re
@@ -70,6 +71,40 @@ SPK_MODE = os.getenv("SPK_MODE", "vad_segment")
 
 _model = None
 _model_lock = threading.Lock()
+
+
+class _SuppressFunasrPuncNoise(logging.Filter):
+    """过滤 funasr 关于 punc_model 的两条误报日志。
+
+    `auto_model.py` 的 spk 分支写成：
+
+        if raw_text is None and self.spk_mode == "punc_segment":
+            logging.warning("punc_model is missing, falling back to vad_segment...")
+            self.spk_mode = "vad_segment"
+        elif raw_text is None:
+            logging.error("Missing punc_model, which is required by spk_model.")
+
+    `raw_text` 只在 `self.punc_model is not None` 时才会被赋值，所以**不配
+    punc_model 时每次请求都会命中其中一条**，与 spk_mode 无关。但这两条都是误报：
+    SenseVoice 的 CTC 自带标点，不需要 punc_model；spk_mode="vad_segment"
+    （funasr 自己 fallback 过去的那个模式）也不需要 punc_model，句段正常产出。
+    保留这些日志只会让人以为服务坏了。"""
+
+    _NOISE = (
+        "Missing punc_model, which is required by spk_model.",
+        "punc_model is missing, falling back to vad_segment",
+        "Missing punc_model, which is required for punc_segment",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(n in msg for n in self._NOISE)
+
+
+logging.getLogger().addFilter(_SuppressFunasrPuncNoise())
 _prewarmed = False
 
 
