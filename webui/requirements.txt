@@ -1,0 +1,4 @@
+gradio>=4.0.0
+requests>=2.31.0
+# 纯 Python，用于读取上传音频的准确时长（wav/mp3/m4a/flac/ogg），供前端预估耗时
+mutagen>=1.47.0

@@ -7,7 +7,7 @@ echo "Model:  ${MODEL_ID}"
 echo "Port:   ${PORT:-10095}"
 echo "========================="
 
-exec python -m uvicorn api.main:app \
+exec python -m uvicorn main:app \
     --host 0.0.0.0 \
     --port "${PORT:-10095}" \
     --log-level info \
