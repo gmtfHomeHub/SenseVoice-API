@@ -47,6 +47,15 @@ VAD_MERGE_LENGTH_S = int(os.getenv("VAD_MERGE_LENGTH_S", "15"))
 # （实测 500 字 5.1s / 2000 字 21s）。设空字符串可关闭。
 PUNC_MODEL = os.getenv("PUNC_MODEL", "ct-punc")
 
+# 分段依据（仅在有 spk_model 时生效）：
+#   punc_segment（默认）—— 按标点切句，段内文本带标点，可读性最好。
+#   vad_segment   —— 按 VAD 边界切句，段长稳定（受 VAD_MAX_SEGMENT_MS 限制），
+#                   但段内 text 是**未加标点**的原始 ASR 输出（只有顶层 text 有标点）。
+# 何时切 vad_segment：punc_segment 在标点稀疏的输入（音乐、噪声、非中文、
+# 长停顿单声道）上会把多个段塔成一个巨句（实测 300s 音频上 12 段塔成 3 段、
+# 最长 43.7s）。字级 timestamp/words 在两种模式下都是 VAD 校正后的全局时间。
+SPK_MODE = os.getenv("SPK_MODE", "punc_segment")
+
 _model = None
 _model_lock = threading.Lock()
 _prewarmed = False
@@ -139,6 +148,7 @@ async def lifespan(app: FastAPI):
     }
     if ENABLE_SPK:
         kwargs["spk_model"] = "cam++"
+        kwargs["spk_mode"] = SPK_MODE
     if VAD_MODEL:
         # merge_length_s 必须放在 AutoModel kwargs 里，而不是 generate()：
         # inference_with_vad() 先读 kwargs.get("merge_length_s", 15) 才做
@@ -147,10 +157,9 @@ async def lifespan(app: FastAPI):
         kwargs["vad_kwargs"] = {"max_single_segment_time": VAD_MAX_SEGMENT_MS}
         kwargs["merge_length_s"] = VAD_MERGE_LENGTH_S
     if PUNC_MODEL:
-        # 刻意不设 spk_mode：保持默认 "punc_segment"。这个模式下的 sentence_info
-        # 是按标点切句的，段内文本带标点；改成 "vad_segment" 虽然分段更稳定，
-        # 但每段 text 退化为未加标点的原始 ASR 输出（只顶层 text 有标点）。
-        # 字级 timestamp/words 在两种模式下都是 VAD 校正后的全局时间，不受影响。
+        # 标点在 spk_mode 分支之前就算好并写回 result["text"]，所以顶层 text
+        # 在两种 spk_mode 下都有标点；差别只在 sentence_info 的分段依据与
+        # 段内 text 是否带标点（见 SPK_MODE 注释）。
         kwargs["punc_model"] = PUNC_MODEL
 
     _model = AutoModel(**kwargs)
@@ -234,6 +243,7 @@ async def health():
         "vad_max_segment_s": VAD_MAX_SEGMENT_MS / 1000.0,
         "vad_merge_length_s": VAD_MERGE_LENGTH_S,
         "punc": PUNC_MODEL or None,
+        "spk_mode": SPK_MODE if ENABLE_SPK else None,
     }
 
 

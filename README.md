@@ -95,10 +95,16 @@ services:
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `PUNC_MODEL` | `ct-punc` | CT-Transformer 标点模型（映射到 HF 的 `funasr/ct-punc`，**1.13GB**）。置为空字符串关闭 |
+| `SPK_MODE` | `punc_segment` | 分段依据。`punc_segment` 按标点切句，`vad_segment` 按 VAD 切句（仅 `ENABLE_SPK=true` 时生效） |
 
 SenseVoice 的 CTC 几乎不出标点（偶尔蹦一个「。」），不加的话 5 分钟转出来是
 「我想我想去我想然后回家吃饭」这种。加上 `punc_model` 后 funasr 在 ASR 之后多跑一遍
-标点模型，插回 `。` `，` `？` `、`。
+标点模型，插回 `。` `，` `？` `、`。模型本身效果正常（实测）：
+
+```
+输入: 今天天气不错我们去公园散步看了一场电影然后回家吃饭休息明天还要上班所以早点睡
+输出: 今天天气不错，我们去公园散步看了一场电影。然后回家吃饭休息，明天还要上班，所以早点睡。
+```
 
 **代价（实测，J3455 CPU 4 线程）**：
 
@@ -107,14 +113,25 @@ SenseVoice 的 CTC 几乎不出标点（偶尔蹦一个「。」），不加的�
 | 模型大小 | 1.13GB（`model.pt` 1.126GB），首启需下载 |
 | 标点推理 | **约 10 字/秒**（500 字 5.1s，2000 字 21s，3 次一致） |
 | 典型开销 | 5 分钟视频约 2000–3000 字 → **+20–30s**，相对转写耗时约 +12–18% |
-| 内存 | 后端约 2.1GiB → 3.2GiB（`mem_limit: 8g` 内） |
+| 内存 | 后端约 2.1GiB → 2.85GiB（`mem_limit: 8g` 内） |
 
-**为什么不开 `spk_mode="vad_segment"`**：加了 `punc_model` 后 funasr 默认走
-`spk_mode="punc_segment"`，`sentence_info` 改成按标点切句（段内文本带标点）。若显式
-退回 `vad_segment`，分段虽更稳定，但每段 `text` 退化为**未加标点**的原始 ASR 输出
-（`<|yue|><|withitn|>…` 那种，只有顶层 `text` 有标点）—— 可读性反而更差。
-字级 `timestamp` / `words` 在两种模式下都是 VAD 校正后的全局时间，不受影响。
+### SPK_MODE：punc_segment vs vad_segment
 
+300s 音频、三种配置同一份音频的对照实测：
+
+| 配置 | segments | 段长范围 | 段内文本 |
+| --- | --- | --- | --- |
+| 无 punc | 12 | 0.6 – 15.4s | 原始 ASR 输出（带 `<\|…\|>` 标签） |
+| `punc_segment` | **3** | 16.0 – **43.7s** ⚠ | **带标点** |
+| `vad_segment` | 12 | 0.6 – 15.4s | 原始 ASR 输出（无标点插入） |
+
+`punc_segment` 下句段依据标点边界，**标点稀疏时多个段会塔成一个巨句**。
+合成音频几乎不出文本，标点极少，所以塔得厉害；真实语音标点密集，句段一般是
+3–10s 的合理长度。遇到音乐/噪声/非中文/长停顿单声道这类标点稀疏的输入，
+设 `SPK_MODE=vad_segment` 可换回稳定分段，代价是段内文本不再有标点
+（顶层 `text` 仍有）。
+
+字级 `timestamp` / `words` 在两种模式下都是 VAD 校正后的全局时间，**不受影响**。
 关闭 `punc_model` 后，`spk_model` 仍可用但日志会反复刷
 `[ERROR] Missing punc_model, which is required by spk_model.`——这是 funasr 的
 **状态泄漏 bug**：第一次请求打 warning 并把共享实例的 `self.spk_mode` 永久改成
