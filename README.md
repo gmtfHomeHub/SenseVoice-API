@@ -57,6 +57,34 @@ services:
 > `starlette.concurrency.run_in_threadpool` 推入线程池，不再阻塞事件循环
 > （上游写法下，转写期间 `/health` 同样无法响应）。
 
+### 长音频：VAD 分段（默认开启，不建议关闭）
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `VAD_MODEL` | `fsmn-vad` | VAD 模型（映射到 HF 的 `funasr/fsmn-vad`，~25MB）。置为空字符串关闭，仅用于调试 |
+| `VAD_MAX_SEGMENT_MS` | `30000` | 单个 VAD 段的最大时长（毫秒），超长连续语音会被强制切开 |
+| `VAD_MERGE_LENGTH_S` | `15` | 相邻 VAD 段合并到的上限（秒），保证每段都 ≤15s |
+
+**为什么要开 VAD**：SenseVoiceSmall 只在约 30s 以内的音频上训练（LFR 帧率 16.7 帧/s，
+`config.yaml` 的 `max_source_length=2000` 帧）。不加 `vad_model` 时，funasr 的
+`generate()` 走 `self.vad_model is None` 分支直接调用 `inference()`，
+**把整段音频一次性喂进编码器，不做任何切分**：
+
+- 5 分钟音频 = 5000 帧，是训练域上限的数倍。编码器（SANM 全自注意力 +
+  `SinusoidalPositionEncoder` 无长度上限，纯外推）超出训练域后输出退化，
+  CTC 大面积输出 blank —— 表现为「开头整段丢失 + 每十几秒蹦出一个词」。
+- 实测对比（40s 合成音频，CPU）：不加 VAD → 单次 667 帧 forward，19.3s，
+  `text='<|nospeech|>…'`，仅 1 个 token；加 VAD → 切成多段逐段推理，
+  字级时间戳正确分布在 0.27s–39.94s 全区间。
+- 附带收益：`batch_size_s` / `merge_vad` 这两个参数**只在有 `vad_model` 时才生效**，
+  不加 VAD 时它们是完全无操作的死参数。
+- 附带收益：`spk_model="cam++"` 也不加 VAD 就不生效（`inference()` 路径不碰
+  spk_model），`/health` 上的 `spk:true` 只代表模型加载了。
+
+开启后 funasr 会把每段的字级时间戳加上段起始偏移拼回**全局时间轴**
+（`auto_model.py` 的 `t[0] += int(vadsegments[j][0])`），所以 `/v1/audio/transcriptions`
+返回的 `words` / `segments` 时间戳直接就是相对整个文件的绝对时间，无需客户端换算。
+
 ### 启动加速与网络相关
 
 | 环境变量 | 默认 | 说明 |

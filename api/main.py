@@ -1,6 +1,8 @@
 import io
+import math
 import os
 import re
+import struct
 import tempfile
 import threading
 import time
@@ -20,8 +22,24 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 ENABLE_SPK = os.getenv("ENABLE_SPK", "false").lower() == "true"
 # 0 = 不限制；>0 时长超过该秒数的请求立即 413，避免长时间占住单例模型
 MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "0"))
-# 启动时预推理的静音时长（秒），0 = 不预热
+# 启动时预推理的音频时长（秒），0 = 不预热
 PREWARM_SECONDS = float(os.getenv("PREWARM_SECONDS", "2"))
+
+# ── VAD 分段 ───────────────────────────────────────────────────────────────
+# 必须开启。不加 vad_model 时 funasr 走 `vad_model is None` 分支，直接调用
+# inference()，把整段音频一次性喂进 SenseVoiceSmall 编码器——没有任何切分。
+# SenseVoiceSmall 只在约 30s 以内的音频上训练（LFR 帧率 16.7 帧/s，
+# config.yaml max_source_length=2000 帧），5 分钟 = 5000 帧，远超训练域，
+# 编码器输出退化为近随机分布、CTC 大面积输出 blank，表现为「开头整段丢失
+# + 每十几秒蹦出一个词」。加了 vad_model 后 funasr 会先跑 FSMN-VAD 分段，
+# 逐段推理，并把每段的字级时间戳加上段偏移拼回全局时间轴。
+# 设为空字符串可关闭（仅用于调试）。
+VAD_MODEL = os.getenv("VAD_MODEL", "fsmn-vad")
+# 单个 VAD 段的最大时长（毫秒）。连续语音超过该值会被强制切开，
+# 保证每段都落在 SenseVoice 的有效输入范围内。
+VAD_MAX_SEGMENT_MS = int(os.getenv("VAD_MAX_SEGMENT_MS", "30000"))
+# merge_vad 把相邻 VAD 段合并到的上限（秒），让 ASR 有上下文又不超长。
+VAD_MERGE_LENGTH_S = int(os.getenv("VAD_MERGE_LENGTH_S", "15"))
 
 _model = None
 _model_lock = threading.Lock()
@@ -115,6 +133,13 @@ async def lifespan(app: FastAPI):
     }
     if ENABLE_SPK:
         kwargs["spk_model"] = "cam++"
+    if VAD_MODEL:
+        # merge_length_s 必须放在 AutoModel kwargs 里，而不是 generate()：
+        # inference_with_vad() 先读 kwargs.get("merge_length_s", 15) 才做
+        # deep_update(kwargs, cfg)，所以 generate() 里传不进去。
+        kwargs["vad_model"] = VAD_MODEL
+        kwargs["vad_kwargs"] = {"max_single_segment_time": VAD_MAX_SEGMENT_MS}
+        kwargs["merge_length_s"] = VAD_MERGE_LENGTH_S
 
     _model = AutoModel(**kwargs)
 
@@ -126,11 +151,16 @@ async def lifespan(app: FastAPI):
 
 
 def _prewarm() -> None:
-    """推理一次静音音频，预热 torch/oneDNN 图。
+    """推理一次音频，预热 torch/oneDNN 图。
 
     CPU 上首个真实请求会因 torch 内核编译/图缓存而阻塞 2-4 分钟，
     用户侧表现为「一直转、最后报超时」。预热后首个请求也只需正常耗时。
     PREWARM_SECONDS=0 可关闭。
+
+    注意：预热点必须是「有声」信号，不能用纯静音或低电平噪声。开了 VAD 后
+    VAD 会判定静音/噪声为无语音，直接短路返回空结果，ASR 编码器完全不会执行，
+    预热就失效了（实测静音 0.06s / 噪声 0.05s / 音调 1.30s，只有音调跑到
+    encoder）。这里用 440Hz 音调 + 淡入淡出，确保 VAD 放行。
     """
     import wave as _wave
 
@@ -143,7 +173,16 @@ def _prewarm() -> None:
                 w.setnchannels(1)
                 w.setsampwidth(2)
                 w.setframerate(16000)
-                w.writeframes(b"\x00\x00" * int(16000 * PREWARM_SECONDS))
+                n = int(16000 * PREWARM_SECONDS)
+                frames = bytearray()
+                for i in range(n):
+                    t = i / 16000.0
+                    fade = min(1.0, t / 0.02, (PREWARM_SECONDS - t) / 0.02)
+                    v = 0.3 * math.sin(2 * math.pi * 440.0 * t) * fade
+                    frames += struct.pack(
+                        "<h", int(max(-1.0, min(1.0, v)) * 32767)
+                    )
+                w.writeframes(bytes(frames))
 
         t0 = time.time()
         with _model_lock:
@@ -179,6 +218,9 @@ async def health():
         "prewarmed": _prewarmed,
         "features": ["emotion", "event", "language_detection", "timestamps", "itn"],
         "spk": ENABLE_SPK,
+        "vad": VAD_MODEL or None,
+        "vad_max_segment_s": VAD_MAX_SEGMENT_MS / 1000.0,
+        "vad_merge_length_s": VAD_MERGE_LENGTH_S,
     }
 
 
