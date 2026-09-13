@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
         "device": DEVICE,
     }
     if ENABLE_SPK:
-        kwargs["spk_model"] = "funasr/cam++"
+        kwargs["spk_model"] = "cam++"
 
     _model = AutoModel(**kwargs)
     yield
