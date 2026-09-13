@@ -90,6 +90,36 @@ services:
 （`auto_model.py` 的 `t[0] += int(vadsegments[j][0])`），所以 `/v1/audio/transcriptions`
 返回的 `words` / `segments` 时间戳直接就是相对整个文件的绝对时间，无需客户端换算。
 
+### 标点：ct-punc（默认开启）
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PUNC_MODEL` | `ct-punc` | CT-Transformer 标点模型（映射到 HF 的 `funasr/ct-punc`，**1.13GB**）。置为空字符串关闭 |
+
+SenseVoice 的 CTC 几乎不出标点（偶尔蹦一个「。」），不加的话 5 分钟转出来是
+「我想我想去我想然后回家吃饭」这种。加上 `punc_model` 后 funasr 在 ASR 之后多跑一遍
+标点模型，插回 `。` `，` `？` `、`。
+
+**代价（实测，J3455 CPU 4 线程）**：
+
+| 项目 | 数值 |
+| --- | --- |
+| 模型大小 | 1.13GB（`model.pt` 1.126GB），首启需下载 |
+| 标点推理 | **约 10 字/秒**（500 字 5.1s，2000 字 21s，3 次一致） |
+| 典型开销 | 5 分钟视频约 2000–3000 字 → **+20–30s**，相对转写耗时约 +12–18% |
+| 内存 | 后端约 2.1GiB → 3.2GiB（`mem_limit: 8g` 内） |
+
+**为什么不开 `spk_mode="vad_segment"`**：加了 `punc_model` 后 funasr 默认走
+`spk_mode="punc_segment"`，`sentence_info` 改成按标点切句（段内文本带标点）。若显式
+退回 `vad_segment`，分段虽更稳定，但每段 `text` 退化为**未加标点**的原始 ASR 输出
+（`<|yue|><|withitn|>…` 那种，只有顶层 `text` 有标点）—— 可读性反而更差。
+字级 `timestamp` / `words` 在两种模式下都是 VAD 校正后的全局时间，不受影响。
+
+关闭 `punc_model` 后，`spk_model` 仍可用但日志会反复刷
+`[ERROR] Missing punc_model, which is required by spk_model.`——这是 funasr 的
+**状态泄漏 bug**：第一次请求打 warning 并把共享实例的 `self.spk_mode` 永久改成
+`"vad_segment"`，之后每次请求都走 `elif` 分支打 ERROR。
+
 ### 启动加速与网络相关
 
 | 环境变量 | 默认 | 说明 |

@@ -41,6 +41,12 @@ VAD_MAX_SEGMENT_MS = int(os.getenv("VAD_MAX_SEGMENT_MS", "20000"))
 # merge_vad 把相邻 VAD 段合并到的上限（秒），让 ASR 有上下文又不超长。
 VAD_MERGE_LENGTH_S = int(os.getenv("VAD_MERGE_LENGTH_S", "15"))
 
+# ct-punc：CT-Transformer 标点模型，给 SenseVoice 的裸文本补标点。
+# SenseVoice 几乎不出标点（偶尔蹦一个「。」），长文本读起来是
+# 「我想我想去我想」这种。代价：模型 1.13GB（首启下载），推理约 10 字/秒
+# （实测 500 字 5.1s / 2000 字 21s）。设空字符串可关闭。
+PUNC_MODEL = os.getenv("PUNC_MODEL", "ct-punc")
+
 _model = None
 _model_lock = threading.Lock()
 _prewarmed = False
@@ -140,6 +146,12 @@ async def lifespan(app: FastAPI):
         kwargs["vad_model"] = VAD_MODEL
         kwargs["vad_kwargs"] = {"max_single_segment_time": VAD_MAX_SEGMENT_MS}
         kwargs["merge_length_s"] = VAD_MERGE_LENGTH_S
+    if PUNC_MODEL:
+        # 刻意不设 spk_mode：保持默认 "punc_segment"。这个模式下的 sentence_info
+        # 是按标点切句的，段内文本带标点；改成 "vad_segment" 虽然分段更稳定，
+        # 但每段 text 退化为未加标点的原始 ASR 输出（只顶层 text 有标点）。
+        # 字级 timestamp/words 在两种模式下都是 VAD 校正后的全局时间，不受影响。
+        kwargs["punc_model"] = PUNC_MODEL
 
     _model = AutoModel(**kwargs)
 
@@ -221,6 +233,7 @@ async def health():
         "vad": VAD_MODEL or None,
         "vad_max_segment_s": VAD_MAX_SEGMENT_MS / 1000.0,
         "vad_merge_length_s": VAD_MERGE_LENGTH_S,
+        "punc": PUNC_MODEL or None,
     }
 
 
