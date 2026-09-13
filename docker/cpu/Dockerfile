@@ -27,6 +27,12 @@ ENV DEVICE=cpu \
     HF_HOME=/root/.cache/huggingface \
     HF_ENDPOINT=https://hf-mirror.com \
     HF_HUB_DISABLE_XET=1 \
+    # funasr 运行时可能内部调用 `pip install -r <model>/requirements.txt`（无超时），
+    # 预设镜像源避免在受限网络下卡死容器启动
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_DEFAULT_TIMEOUT=60 \
+    # 启动时预推理的静音秒数，预热 torch/oneDNN；0 = 不预热
+    PREWARM_SECONDS=2 \
     PYTHONUNBUFFERED=1
 
 EXPOSE 10095

@@ -56,3 +56,16 @@ services:
 > 为了让该端点在推理期间仍然可响应，`/v1/audio/transcriptions` 的推理已通过
 > `starlette.concurrency.run_in_threadpool` 推入线程池，不再阻塞事件循环
 > （上游写法下，转写期间 `/health` 同样无法响应）。
+
+### 启动加速与网络相关
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PREWARM_SECONDS` | `2` | 启动时对一段静音做一次推理，预热 torch/oneDNN 图。CPU 上首个真实请求否则会因内核图缓存阻塞 2-4 分钟，表现为「一直转最后超时」。`0` 关闭 |
+| `PIP_INDEX_URL` | 清华源 | 兜底：funasr 可能内部执行 `pip install -r <model>/requirements.txt`（无超时），预设镜像源避免卡死 |
+
+> **为什么 `trust_remote_code=False` 是必须的**：funasr 在 `trust_remote_code=True` 时会执行
+> `install_model_requirements`，即对一个**没有超时**的裸 `pip install -r <model>/requirements.txt`
+> 子进程。SenseVoiceSmall 的该文件要求 `torch`、`modelscope`、`huggingface`、`gradio`、
+> `numpy<=1.26.4` —— 在受限网络下会让容器启动永久卡住，且每次重启都会尝试把 numpy 降级。
+> SenseVoiceSmall 与 campplus 都是 funasr 原生注册模型，不需要远程代码，跳过该步骤是安全的。

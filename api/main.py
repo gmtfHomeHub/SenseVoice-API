@@ -20,9 +20,12 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 ENABLE_SPK = os.getenv("ENABLE_SPK", "false").lower() == "true"
 # 0 = 不限制；>0 时长超过该秒数的请求立即 413，避免长时间占住单例模型
 MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "0"))
+# 启动时预推理的静音时长（秒），0 = 不预热
+PREWARM_SECONDS = float(os.getenv("PREWARM_SECONDS", "2"))
 
 _model = None
 _model_lock = threading.Lock()
+_prewarmed = False
 
 
 class _ActiveJob:
@@ -102,7 +105,11 @@ async def lifespan(app: FastAPI):
     kwargs = {
         "model": MODEL_ID,
         "hub": "hf",
-        "trust_remote_code": True,
+        # SenseVoiceSmall 与 campplus 都是 funasr 原生模型，不需要远程代码。
+        # 必须设为 False：为 True 时 funasr 会执行 install_model_requirements，
+        # 即对一个无超时的裸 `pip install -r <model>/requirements.txt` 子进程，
+        # 在受限网络下会卡死容器启动，并尝试把 numpy 降级到 <=1.26.4。
+        "trust_remote_code": False,
         "disable_update": True,
         "device": DEVICE,
     }
@@ -110,8 +117,54 @@ async def lifespan(app: FastAPI):
         kwargs["spk_model"] = "cam++"
 
     _model = AutoModel(**kwargs)
+
+    if PREWARM_SECONDS > 0:
+        await run_in_threadpool(_prewarm)
+
     yield
     _model = None
+
+
+def _prewarm() -> None:
+    """推理一次静音音频，预热 torch/oneDNN 图。
+
+    CPU 上首个真实请求会因 torch 内核编译/图缓存而阻塞 2-4 分钟，
+    用户侧表现为「一直转、最后报超时」。预热后首个请求也只需正常耗时。
+    PREWARM_SECONDS=0 可关闭。
+    """
+    import wave as _wave
+
+    global _prewarmed
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            path = tmp.name
+            with _wave.open(tmp.name, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(b"\x00\x00" * int(16000 * PREWARM_SECONDS))
+
+        t0 = time.time()
+        with _model_lock:
+            _model.generate(
+                input=path,
+                cache={},
+                language="auto",
+                use_itn=True,
+                batch_size_s=300,
+                merge_vad=True,
+            )
+        print(f"[prewarm] done in {time.time() - t0:.1f}s", flush=True)
+        _prewarmed = True
+    except Exception as e:
+        print(f"[prewarm] failed: {e}", flush=True)
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 app = FastAPI(title="SenseVoice-API", version="1.0.0", lifespan=lifespan)
@@ -123,6 +176,7 @@ async def health():
         "status": "ok" if _model else "loading",
         "model": MODEL_ID,
         "device": DEVICE,
+        "prewarmed": _prewarmed,
         "features": ["emotion", "event", "language_detection", "timestamps", "itn"],
         "spk": ENABLE_SPK,
     }
