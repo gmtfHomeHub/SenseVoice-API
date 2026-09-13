@@ -26,6 +26,7 @@ ENV DEVICE=cpu \
     PORT=10095 \
     HF_HOME=/root/.cache/huggingface \
     HF_ENDPOINT=https://hf-mirror.com \
+    HF_HUB_DISABLE_XET=1 \
     PYTHONUNBUFFERED=1
 
 EXPOSE 10095
