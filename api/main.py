@@ -41,20 +41,32 @@ VAD_MAX_SEGMENT_MS = int(os.getenv("VAD_MAX_SEGMENT_MS", "20000"))
 # merge_vad 把相邻 VAD 段合并到的上限（秒），让 ASR 有上下文又不超长。
 VAD_MERGE_LENGTH_S = int(os.getenv("VAD_MERGE_LENGTH_S", "15"))
 
-# ct-punc：CT-Transformer 标点模型，给 SenseVoice 的裸文本补标点。
-# SenseVoice 几乎不出标点（偶尔蹦一个「。」），长文本读起来是
-# 「我想我想去我想」这种。代价：模型 1.13GB（首启下载），推理约 10 字/秒
-# （实测 500 字 5.1s / 2000 字 21s）。设空字符串可关闭。
-PUNC_MODEL = os.getenv("PUNC_MODEL", "ct-punc")
+# ── 标点：不使用 punc_model ─────────────────────────────────────────────────
+# SenseVoiceSmall 的 sentencepiece 词表（25055 token）里「，。？、！；：」都是
+# 单字符 token —— **SenseVoice 的 CTC 本身就出标点**，不需要额外标点模型。
+#
+# 实测证实（ct-punc 对已带标点的文本会重复插入）：
+#   输入 今天天气不错，我们去公园散步。
+#   输出 今天天气不错，，，我们去公园散步。。
+#   输入 今天天气不错我们去公园散步
+#   输出 今天天气不错，我们去公园散步。        ← 只有无标点输入才正确
+#
+# 机制：funasr 的 _punctuate_surface_text() 是「原文照抄 + 每个 token 后追加
+# ct-punc 的标点」，不会先剥离 SenseVoice 已有的标点。
+# funasr 自己的文档也这么写（auto_model.py:431 / ct_transformer/model.py:49）：
+#   "Not needed for Fun-ASR-Nano/SenseVoice/Qwen3-ASR (they output punctuation natively)."
+#
+# 所以这里刻意不传 punc_model。ct-punc 模型 1.13GB、推理约 10 字/秒，
+# 既慢又会让输出全是「。。，，？？」。
 
-# 分段依据（仅在有 spk_model 时生效）：
-#   punc_segment（默认）—— 按标点切句，段内文本带标点，可读性最好。
-#   vad_segment   —— 按 VAD 边界切句，段长稳定（受 VAD_MAX_SEGMENT_MS 限制），
-#                   但段内 text 是**未加标点**的原始 ASR 输出（只有顶层 text 有标点）。
-# 何时切 vad_segment：punc_segment 在标点稀疏的输入（音乐、噪声、非中文、
-# 长停顿单声道）上会把多个段塔成一个巨句（实测 300s 音频上 12 段塔成 3 段、
-# 最长 43.7s）。字级 timestamp/words 在两种模式下都是 VAD 校正后的全局时间。
-SPK_MODE = os.getenv("SPK_MODE", "punc_segment")
+# 分段依据（仅在有 spk_model 时生效）。**必须配 vad_segment**：
+#   vad_segment  —— 按 VAD 边界切句，段长稳定（受 VAD_MAX_SEGMENT_MS 限制），
+#                   段内 text 是 SenseVoice 原始输出（**自带标点**）。
+#   punc_segment —— 需要 punc_model 才能产出有意义的句段；没有 punc_model 时
+#                   funasr 会在第一次请求打 warning 并把共享实例的 self.spk_mode
+#                   永久改成 vad_segment（状态泄漏），之后每次请求都刷
+#                   `[ERROR] Missing punc_model, which is required by spk_model.`
+SPK_MODE = os.getenv("SPK_MODE", "vad_segment")
 
 _model = None
 _model_lock = threading.Lock()
@@ -156,11 +168,8 @@ async def lifespan(app: FastAPI):
         kwargs["vad_model"] = VAD_MODEL
         kwargs["vad_kwargs"] = {"max_single_segment_time": VAD_MAX_SEGMENT_MS}
         kwargs["merge_length_s"] = VAD_MERGE_LENGTH_S
-    if PUNC_MODEL:
-        # 标点在 spk_mode 分支之前就算好并写回 result["text"]，所以顶层 text
-        # 在两种 spk_mode 下都有标点；差别只在 sentence_info 的分段依据与
-        # 段内 text 是否带标点（见 SPK_MODE 注释）。
-        kwargs["punc_model"] = PUNC_MODEL
+    # 不传 punc_model：SenseVoice 的 CTC 自带标点，加 ct-punc 会重复插入
+    # （见文件头注释的实测证据）。
 
     _model = AutoModel(**kwargs)
 
@@ -242,7 +251,6 @@ async def health():
         "vad": VAD_MODEL or None,
         "vad_max_segment_s": VAD_MAX_SEGMENT_MS / 1000.0,
         "vad_merge_length_s": VAD_MERGE_LENGTH_S,
-        "punc": PUNC_MODEL or None,
         "spk_mode": SPK_MODE if ENABLE_SPK else None,
     }
 
