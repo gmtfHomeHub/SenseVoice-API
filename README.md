@@ -37,3 +37,22 @@ services:
 - `WS   /v1/audio/transcriptions/stream`
 
 端口 `10095`，与上游完全兼容。
+
+## CPU 变体补充
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DEVICE` | `cpu` | 推理设备，本 fork 固定 `cpu`（上游 GPU 镜像仍用 `docker/gpu/Dockerfile`） |
+| `MAX_AUDIO_SECONDS` | `0` | 音频时长护栏。`0` = 不限制；`>0` 时长超出的请求立即 `413`，避免长时间占住单例模型 |
+
+### `POST /v1/cancel`
+
+取消当前正在进行的转写任务，返回 `{"cancelled": true, "was_active": <bool>}`。
+
+被取消的任务在后端返回 `499` + `{"cancelled": true}` 并丢弃结果。
+
+> funasr 的 `AutoModel.generate()` 是单次同步调用，内部没有可抢占的边界，
+> 因此「取消」不能打断途中的计算，语义是「断开连接 + 丢弃结果」。
+> 为了让该端点在推理期间仍然可响应，`/v1/audio/transcriptions` 的推理已通过
+> `starlette.concurrency.run_in_threadpool` 推入线程池，不再阻塞事件循环
+> （上游写法下，转写期间 `/health` 同样无法响应）。

@@ -12,14 +12,48 @@ import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 MODEL_ID = os.getenv("MODEL_ID", "FunAudioLLM/SenseVoiceSmall")
 DEVICE = os.getenv("DEVICE", "cuda:0")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 ENABLE_SPK = os.getenv("ENABLE_SPK", "false").lower() == "true"
+# 0 = 不限制；>0 时长超过该秒数的请求立即 413，避免长时间占住单例模型
+MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "0"))
 
 _model = None
 _model_lock = threading.Lock()
+
+
+class _ActiveJob:
+    """进程内当前任务句柄。
+
+    单例模型 + BATCH_SIZE=1，任一时刻至多一个转写任务，因此用一个全局
+    cancel 标志即可表达「取消当前任务」。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cancel = threading.Event()
+        self.started_at: Optional[float] = None
+
+    def begin(self) -> "threading.Event":
+        with self.lock:
+            self.cancel.clear()
+            self.started_at = time.time()
+            return self.cancel
+
+    def end(self) -> None:
+        with self.lock:
+            self.started_at = None
+
+    @property
+    def is_active(self) -> bool:
+        with self.lock:
+            return self.started_at is not None
+
+
+_ACTIVE = _ActiveJob()
 
 # SenseVoice outputs: <|lang|><|emotion|><|event|><|textnorm|>text
 _TAG_PATTERN = re.compile(r"<\|([^|]*)\|>")
@@ -114,6 +148,30 @@ async def list_models():
     }
 
 
+@app.post("/v1/cancel")
+async def cancel_transcription() -> JSONResponse:
+    """取消当前正在进行的转写任务。
+
+    funasr 的 generate() 是单次同步调用，内部没有可抢占的边界，
+    因此取消的实际语义是：客户端断开后，后端跳过结果后处理并丢弃结果。
+    generate() 本身会自然跑完，无法在途中打断。
+    该端点之所以能返回，依赖推理被推入线程池（run_in_threadpool），
+    事件循环未阻塞。
+    """
+    was_active = _ACTIVE.is_active
+    _ACTIVE.cancel.set()
+    return JSONResponse(
+        content={
+            "cancelled": True,
+            "was_active": was_active,
+            "note": (
+                "result is discarded and post-processing is skipped; "
+                "the in-flight generate() call finishes on its own"
+            ),
+        }
+    )
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
@@ -128,18 +186,60 @@ async def transcribe(
     - emotion: detected emotion (happy, sad, angry, neutral)
     - event: detected audio event (Speech, Music, Applause, Laughter, etc.)
     - language: auto-detected language code
+
+    实现要点：
+    - 推理通过 run_in_threadpool 推入线程池。否则同步 CPU 计算会霸占事件
+      循环，转写期间 /health 与 /v1/cancel 都无法响应。
+    - 每个任务一个 cancel 标志，供 /v1/cancel 设置。
+    - 推理完成后若已被取消，返回 499 + {"cancelled": true} 并丢弃结果。
     """
     if not _model:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     audio_bytes = await file.read()
-    suffix = _get_suffix(file.filename)
 
+    if MAX_AUDIO_SECONDS > 0:
+        duration = _get_duration(audio_bytes)
+        if duration and duration > MAX_AUDIO_SECONDS:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"audio duration {duration:.1f}s exceeds "
+                    f"MAX_AUDIO_SECONDS={MAX_AUDIO_SECONDS:.0f}s"
+                ),
+            )
+
+    cancel_evt = _ACTIVE.begin()
+    try:
+        return await run_in_threadpool(
+            _transcribe_sync,
+            audio_bytes,
+            _get_suffix(file.filename),
+            language,
+            response_format,
+            timestamp_granularities,
+            cancel_evt,
+        )
+    finally:
+        _ACTIVE.end()
+
+
+def _transcribe_sync(
+    audio_bytes: bytes,
+    suffix: str,
+    language: Optional[str],
+    response_format: str,
+    timestamp_granularities: Optional[str],
+    cancel_evt: "threading.Event",
+) -> JSONResponse:
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
     try:
+        if cancel_evt.is_set():
+            return JSONResponse(content={"cancelled": True}, status_code=499)
+
         want_timestamps = (
             response_format == "verbose_json"
             or (timestamp_granularities and "word" in timestamp_granularities)
@@ -159,6 +259,10 @@ async def transcribe(
         elapsed = time.time() - start_time
     finally:
         os.unlink(tmp_path)
+
+    # 推理已结束但客户端已取消：丢弃结果，跳过后续后处理
+    if cancel_evt.is_set():
+        return JSONResponse(content={"cancelled": True}, status_code=499)
 
     raw_text = _extract_raw(result)
     parsed = _parse_rich_text(raw_text)
